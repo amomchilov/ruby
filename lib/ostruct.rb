@@ -107,7 +107,11 @@
 # For all these reasons, consider not using OpenStruct at all.
 #
 class OpenStruct
-  VERSION = "0.5.5"
+  VERSION = "0.5.6"
+
+  def self.optimized?
+    true
+  end
 
   #
   # Creates a new OpenStruct object.  By default, the resulting OpenStruct
@@ -126,24 +130,15 @@ class OpenStruct
   def initialize(hash=nil)
     if hash
       update_to_values!(hash)
-    else
-      @table = {}
     end
   end
 
-  # Duplicates an OpenStruct object's Hash table.
-  private def initialize_clone(orig) # :nodoc:
-    super # clones the singleton class for us
-    @table = @table.dup unless @table.frozen?
-  end
-
-  private def initialize_dup(orig) # :nodoc:
-    super
-    update_to_values!(@table)
+  def dup
+    # Is this the right way to ensure the singleton class is cloned?
+    clone(freeze: false)
   end
 
   private def update_to_values!(hash) # :nodoc:
-    @table = {}
     hash.each_pair do |k, v|
       set_ostruct_member_value!(k, v)
     end
@@ -169,17 +164,35 @@ class OpenStruct
   if {test: :to_h}.to_h{ [:works, true] }[:works] # RUBY_VERSION < 2.6 compatibility
     def to_h(&block)
       if block
-        @table.to_h(&block)
+        instance_variables.to_h do |name|
+          key = name.to_s.delete_prefix("@").to_sym
+
+          block.call(key, instance_variable_get(name))
+        end
       else
-        @table.dup
+        instance_variables.to_h do |name|
+          key = name.to_s.delete_prefix("@").to_sym
+
+          [key, instance_variable_get(name)]
+        end
       end
     end
   else
     def to_h(&block)
       if block
-        @table.map(&block).to_h
+        instance_variables
+          .map do |name|
+            key = name.to_s.delete_prefix("@").to_sym
+
+            [key, instance_variable_get(name)]
+          end
+          .to_h
       else
-        @table.dup
+        instance_variables.to_h do |name|
+          key = name.to_s.delete_prefix("@").to_sym
+
+          [key, instance_variable_get(name)]
+        end
       end
     end
   end
@@ -197,8 +210,10 @@ class OpenStruct
   #   data.each_pair.to_a   # => [[:country, "Australia"], [:capital, "Canberra"]]
   #
   def each_pair
-    return to_enum(__method__) { @table.size } unless defined?(yield)
-    @table.each_pair{|p| yield p}
+    # TODO: optimize `instance_variables.size` to avoid array allocation
+    return to_enum(__method__) { instance_variables.size } unless defined?(yield)
+    # TODO: Optimize #to_h usage
+    to_h.each_pair{|p| yield p}
     self
   end
 
@@ -206,7 +221,7 @@ class OpenStruct
   # Provides marshalling support for use by the Marshal library.
   #
   def marshal_dump # :nodoc:
-    @table
+    to_h
   end
 
   #
@@ -220,18 +235,23 @@ class OpenStruct
   # define_singleton_method for both the getter method and the setter method.
   #
   def new_ostruct_member!(name) # :nodoc:
-    unless @table.key?(name) || is_method_protected!(name)
-      if defined?(::Ractor)
-        getter_proc = nil.instance_eval{ Proc.new { @table[name] } }
-        setter_proc = nil.instance_eval{ Proc.new {|x| @table[name] = x} }
-        ::Ractor.make_shareable(getter_proc)
-        ::Ractor.make_shareable(setter_proc)
-      else
-        getter_proc = Proc.new { @table[name] }
-        setter_proc = Proc.new {|x| @table[name] = x}
-      end
-      define_singleton_method!(name, &getter_proc)
-      define_singleton_method!("#{name}=", &setter_proc)
+    ivar_name = :"@#{name}"
+
+    unless instance_variable_defined?(ivar_name) || is_method_protected!(name)
+      # if defined?(::Ractor)
+      #   getter_proc = nil.instance_eval{ Proc.new { @table[name] } }
+      #   setter_proc = nil.instance_eval{ Proc.new {|x| @table[name] = x} }
+      #   ::Ractor.make_shareable(getter_proc)
+      #   ::Ractor.make_shareable(setter_proc)
+      # else
+      #   getter_proc = Proc.new { @table[name] }
+      #   setter_proc = Proc.new {|x| @table[name] = x}
+      # end
+      # define_singleton_method!(name, &getter_proc)
+      # define_singleton_method!("#{name}=", &setter_proc)
+
+      # TODO: Optimization opportunity. Call `attr_accessor` once with multiple names, and the looping will be done in C
+      singleton_class.attr_accessor(name)
     end
   end
   private :new_ostruct_member!
@@ -254,11 +274,6 @@ class OpenStruct
     end
   end
 
-  def freeze
-    @table.freeze
-    super
-  end
-
   private def method_missing(mid, *args) # :nodoc:
     len = args.length
     if mname = mid[/.*(?==\z)/m]
@@ -267,7 +282,7 @@ class OpenStruct
       end
       set_ostruct_member_value!(mname, args[0])
     elsif len == 0
-      @table[mid]
+      instance_variable_get(:"@#{mid}")
     else
       begin
         super
@@ -289,7 +304,17 @@ class OpenStruct
   #   person[:age]   # => 70, same as person.age
   #
   def [](name)
-    @table[name.to_sym]
+    # name = name.to_sym
+    #
+    # # # TODO: temporary hack. Is there a reliable way to encode into a valid ivar identifier?
+    # # name = +(name.to_s)
+    # # name.gsub!("?", "__q_q__")
+    # # name.gsub!("!", "__e_p__")
+    #
+    # instance_variable_get(:"@#{name}")
+
+    # Testing: is `#send` faster than `instance_variable_get`? It doesn't need any string manipularion on `name
+    send(name)
   end
 
   #
@@ -304,9 +329,16 @@ class OpenStruct
   #   person.age          # => 42
   #
   def []=(name, value)
-    name = name.to_sym
+    # name = name.to_sym
+
+    # # TODO: temporary hack. Is there a reliable way to encode into a valid ivar identifier?
+    # name = +(name.to_s)
+    # name.gsub!("?", "__q_q__")
+    # name.gsub!("!", "__e_p__")
+
     new_ostruct_member!(name)
-    @table[name] = value
+    # instance_variable_set(:"@#{name}", value) # TODO: is it worth reusing the symbol with `new_ostruct_member!`?
+    send("#{name}=", value) # Testing: is `#send` faster than `instance_variable_set`?
   end
   alias_method :set_ostruct_member_value!, :[]=
   private :set_ostruct_member_value!
@@ -331,7 +363,12 @@ class OpenStruct
     rescue NoMethodError
       raise! TypeError, "#{name} is not a symbol nor a string"
     end
-    @table.dig(name, *names)
+
+    value = self[name]
+    return value if names.empty? # Done digging
+
+    return nil unless value.respond_to?(:dig) # TODO: is there a better way to do this?
+    value.dig(*names)
   end
 
   #
@@ -362,8 +399,14 @@ class OpenStruct
       singleton_class.remove_method(sym, "#{sym}=")
     rescue NameError
     end
-    @table.delete(sym) do
-      return yield if block
+
+    ivar_name = :"@#{sym}"
+
+    if instance_variable_defined?(ivar_name)
+      remove_instance_variable(ivar_name)
+    elsif block
+      yield
+    else
       raise! NameError.new("no field `#{sym}' in #{self}", sym)
     end
   end
@@ -380,7 +423,8 @@ class OpenStruct
     else
       ids << object_id
       begin
-        detail = @table.map do |key, value|
+        # TODO: worth optimizing out this `#to_h`?
+        detail = to_h.map do |key, value|
           " #{key}=#{value.inspect}"
         end.join(',')
       ensure
@@ -410,7 +454,8 @@ class OpenStruct
   #
   def ==(other)
     return false unless other.kind_of?(OpenStruct)
-    @table == other.table!
+    # TODO: Implement C extension that uses `obj_ivar_each` and avoids the allocations
+    to_h == other.to_h
   end
 
   #
@@ -420,22 +465,30 @@ class OpenStruct
   #
   def eql?(other)
     return false unless other.kind_of?(OpenStruct)
-    @table.eql?(other.table!)
+    # TODO: Implement C extension that uses `obj_ivar_each` and avoids the allocations
+    to_h.eql?(other.to_h)
   end
 
   # Computes a hash code for this OpenStruct.
   def hash # :nodoc:
-    @table.hash
+    # TODO: Implement C extension that uses `obj_ivar_each` and avoids the allocations
+    to_h.hash
   end
 
   #
   # Provides marshalling support for use by the YAML library.
   #
   def encode_with(coder) # :nodoc:
-    @table.each_pair do |key, value|
+    p instance_variables # Why are these sometimes out of order?
+    # Ivar orderings seems to be reliable when I try it in IRB.
+
+    each_pair do |key, value|
       coder[key.to_s] = value
     end
-    if @table.size == 1 && @table.key?(:table) # support for legacy format
+
+    # TODO: Is this code branch still relevant?
+    # TODO: optimize `instance_variables.size` to avoid array allocation
+    if instance_variables.size == 1 && instance_variable_defined?(:@table) # support for legacy format
       # in the very unlikely case of a single entry called 'table'
       coder['legacy_support!'] = true # add a bogus second entry
     end

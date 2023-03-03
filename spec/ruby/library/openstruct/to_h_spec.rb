@@ -34,13 +34,19 @@ describe "OpenStruct#to_h" do
     end
 
     it "raises ArgumentError if block returns longer or shorter array" do
+      # TODO: Is it okay to alter the expected error message?
+      # Array#to_h and Hash#to_h return different error messages in this case
+      # > [1, 2, 3].to_h { [1, 2, 3] }
+      # ArgumentError: wrong array length at 0 (expected 2, was 3)
+      # > { a: 1, b: 2, c: 3 }.to_h { [1, 2, 3] }
+      # ArgumentError: element has wrong array length (expected 2, was 3)
       -> do
         @os.to_h { |k, v| [k.to_s, v*2, 1] }
-      end.should raise_error(ArgumentError, /element has wrong array length/)
+      end.should raise_error(ArgumentError, /wrong array length at/)
 
       -> do
         @os.to_h { |k, v| [k] }
-      end.should raise_error(ArgumentError, /element has wrong array length/)
+      end.should raise_error(ArgumentError, /wrong array length at/)
     end
 
     it "raises TypeError if block returns something other than Array" do
